@@ -57,6 +57,8 @@ class Settings:
         # Server config
         self.port: int = int(os.getenv("PORT", "8000"))
         self.host: str = os.getenv("HOST", "0.0.0.0")
+        # Ollama compatibility version for /api/version
+        self.ollama_version: str = os.getenv("OLLAMA_VERSION", "0.1.32")
 
         # Model registry
         self.models: Dict[str, ModelConfig] = self._load_models_from_env()
@@ -136,4 +138,3 @@ def resolve_gemini_config(
     api_key = api_key_hdr or api_key
 
     return base_url, api_version, api_key, model_id
-

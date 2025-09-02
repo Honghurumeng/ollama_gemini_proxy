@@ -326,3 +326,9 @@ async def api_tags():
             }
         )
     return {"models": items}
+
+
+@router.get("/api/version")
+async def api_version():
+    # Minimal Ollama compatibility endpoint
+    return {"version": settings.ollama_version}

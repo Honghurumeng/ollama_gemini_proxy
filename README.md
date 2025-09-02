@@ -7,6 +7,7 @@ A minimal FastAPI server that accepts Ollama-compatible endpoints and forwards t
 - `POST /api/chat`: Compatible with Ollama's `/api/chat`. Supports `stream=true` and `tools`.
 - `POST /api/generate`: Compatible with Ollama's `/api/generate`. Supports `stream=true` and `tools`.
 - `GET /api/tags`: Lists available models from the `.env` registry (Ollama-style tags listing).
+- `GET /api/version`: Returns a version string (env `OLLAMA_VERSION`, default `0.1.32`).
 
 ## Configuration
 
