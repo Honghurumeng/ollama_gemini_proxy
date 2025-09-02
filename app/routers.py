@@ -240,24 +240,41 @@ async def api_chat(req: ChatRequest, request: Request):
                 yield (_json.dumps(err) + "\n").encode()
                 return
             
-            # Accumulate lines to form complete JSON
+            # For Cline compatibility: process line by line for better streaming
             accumulated_lines = []
+            has_content = False
+            
             async for line in stream_iter:
                 accumulated_lines.append(line)
-                
-            # Parse the complete response
-            text, fn = _parse_gemini_stream_response(accumulated_lines)
-            if text or fn:
-                import json as _json
-                event = {
-                    "model": req.model,
-                    "created_at": _now_iso(),
-                    "message": {"role": "assistant", "content": text or ""},
-                    "done": False,
-                }
-                if fn:
-                    event["tool_calls"] = [{"type": "function", **fn}]
-                yield (_json.dumps(event) + "\n").encode()
+                # Try to parse each line individually for better streaming
+                text, fn = _parse_gemini_stream_line(line)
+                if text or fn:
+                    has_content = True
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": text or ""},
+                        "done": False,
+                    }
+                    if fn:
+                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                    yield (_json.dumps(event) + "\n").encode()
+            
+            # Fallback: if no line-by-line content, try accumulated parsing
+            if not has_content:
+                text, fn = _parse_gemini_stream_response(accumulated_lines)
+                if text or fn:
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": text or ""},
+                        "done": False,
+                    }
+                    if fn:
+                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                    yield (_json.dumps(event) + "\n").encode()
 
             # done event
             import json as _json
@@ -360,24 +377,41 @@ async def api_generate(req: GenerateRequest, request: Request):
                 yield (_json.dumps(err) + "\n").encode()
                 return
             
-            # Accumulate lines to form complete JSON
+            # For Cline compatibility: process line by line for better streaming
             accumulated_lines = []
+            has_content = False
+            
             async for line in stream_iter:
                 accumulated_lines.append(line)
-                
-            # Parse the complete response
-            text, fn = _parse_gemini_stream_response(accumulated_lines)
-            if text or fn:
-                import json as _json
-                event = {
-                    "model": req.model,
-                    "created_at": _now_iso(),
-                    "response": text or "",
-                    "done": False,
-                }
-                if fn:
-                    event["tool_calls"] = [{"type": "function", **fn}]
-                yield (_json.dumps(event) + "\n").encode()
+                # Try to parse each line individually for better streaming
+                text, fn = _parse_gemini_stream_line(line)
+                if text or fn:
+                    has_content = True
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "response": text or "",
+                        "done": False,
+                    }
+                    if fn:
+                        event["tool_calls"] = [{"type": "function", **fn}]
+                    yield (_json.dumps(event) + "\n").encode()
+            
+            # Fallback: if no line-by-line content, try accumulated parsing
+            if not has_content:
+                text, fn = _parse_gemini_stream_response(accumulated_lines)
+                if text or fn:
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "response": text or "",
+                        "done": False,
+                    }
+                    if fn:
+                        event["tool_calls"] = [{"type": "function", **fn}]
+                    yield (_json.dumps(event) + "\n").encode()
 
             # done event
             import json as _json
