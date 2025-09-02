@@ -461,29 +461,38 @@ async def api_generate(req: GenerateRequest, request: Request):
 @router.get("/api/tags")
 async def api_tags():
     # Emulate Ollama /api/tags listing as closely as possible.
+    from .logger import get_logger
+    log = get_logger("api_tags")
+    
+    log.info("GET /api/tags called - VS Code Copilot requesting model list")
+    
     items = []
     now = _now_iso()
     if settings.models:
         for alias, mc in settings.models.items():
+            # Ensure size and digest are properly set for VS Code compatibility
+            size = mc.size if mc.size and mc.size > 0 else 815319791  # Use same default as real Ollama
+            digest = mc.digest if mc.digest else "sha256:8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc"
+            
+            # Format name with :latest if no tag specified
+            model_name = mc.name or f"{alias}:latest"
+            
             items.append(
                 {
-                    "name": mc.name or f"{alias}:latest",
-                    "model": mc.model_id,
+                    "name": model_name,
+                    "model": model_name,  # Match real Ollama: model = name
                     "modified_at": mc.modified or now,
-                    "size": mc.size or 0,
-                    "digest": mc.digest or "",
+                    "size": size,
+                    "digest": digest,
                     "details": {
                         "parent_model": mc.parent_model or "",
                         "format": mc.format or "gguf",
-                        "family": mc.family or "",
-                        "families": mc.families or [],
-                        "parameter_size": mc.parameter_size or "",
-                        "quantization_level": mc.quantization_level or "",
-                        "display_name": mc.display_name or alias,
-                        "description": mc.description or "",
-                        # Non-Ollama native fields kept for transparency
-                        "api_version": mc.api_version or "",
-                        "base_url": mc.base_url or "",
+                        "family": mc.family or "gemma3",  # Use gemma3 as default like real Ollama
+                        "families": mc.families or [mc.family or "gemma3"],
+                        "parameter_size": mc.parameter_size or "999.89M",  # Match real Ollama default
+                        "quantization_level": mc.quantization_level or "Q4_K_M",
+                        # Remove non-standard fields that real Ollama doesn't have
+                        # Removed: display_name, description, capabilities, api_version, base_url
                     },
                 }
             )
@@ -491,22 +500,22 @@ async def api_tags():
         items.append(
             {
                 "name": "gemini-default:latest",
-                "model": "gemini-1.5-pro",
+                "model": "gemini-default:latest",  # Match real Ollama format
                 "modified_at": now,
-                "size": 0,
-                "digest": "",
+                "size": 815319791,  # Match real Ollama default
+                "digest": "sha256:8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc",
                 "details": {
                     "parent_model": "",
                     "format": "gguf",
-                    "family": "",
-                    "families": [],
-                    "parameter_size": "",
-                    "quantization_level": "",
-                    "api_version": "",
-                    "base_url": "",
+                    "family": "gemma3",
+                    "families": ["gemma3"],
+                    "parameter_size": "999.89M",
+                    "quantization_level": "Q4_K_M",
                 },
             }
         )
+    
+    log.info(f"Returning {len(items)} models in /api/tags response")
     return {"models": items}
 
 
@@ -516,78 +525,305 @@ async def api_version():
     return {"version": settings.ollama_version}
 
 
+@router.get("/")
+async def health_check():
+    """Health check endpoint for VS Code Copilot compatibility."""
+    return {"status": "ok", "message": "Ollama-compatible server is running"}
+
+
+@router.get("/v1/models")
+async def openai_models():
+    """OpenAI-compatible models endpoint for better compatibility."""
+    models = []
+    if settings.models:
+        for alias, mc in settings.models.items():
+            model_name = mc.name or f"{alias}:latest"
+            models.append({
+                "id": model_name,  # Use the full model name with tag
+                "object": "model", 
+                "created": int(dt.datetime.now().timestamp()),
+                "owned_by": "library",  # Match real Ollama
+            })
+    else:
+        models.append({
+            "id": "gemini-default:latest",
+            "object": "model",
+            "created": int(dt.datetime.now().timestamp()), 
+            "owned_by": "library",  # Match real Ollama
+        })
+    
+    return {
+        "object": "list",
+        "data": models
+    }
+
+
 def _build_show_info(alias: str) -> dict:
     now = _now_iso()
-    if alias in settings.models:
-        mc = settings.models[alias]
+    
+    # Handle cases where alias might already include :tag (e.g., "gemini25pro:latest")
+    # Extract the base alias name for lookup
+    base_alias = alias.split(':')[0]
+    
+    if base_alias in settings.models:
+        mc = settings.models[base_alias]
+        # Use the original alias (which might already have :tag) or fall back to configured name
+        model_name = alias if ':' in alias else (mc.name or f"{base_alias}:latest")
+        size = mc.size if mc.size and mc.size > 0 else 815319791  # Match real Ollama default
+        digest = mc.digest if mc.digest else "sha256:8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc"
+        
+        # Match real Ollama /api/show response structure exactly
         info = {
-            "name": alias,
-            "model": mc.model_id,
-            "modified_at": mc.modified or now,
-            "size": mc.size or 0,
-            "digest": mc.digest or "",
-            "parameters": mc.parameters or "",
-            "modelfile": mc.modelfile or "",
+            "license": mc.license or "MIT License",
+            "modelfile": mc.modelfile or f"# Modelfile for {model_name}\nFROM {model_name}",
+            "parameters": mc.parameters or "top_p                          0.95\nstop                           \"<end_of_turn>\"\ntemperature                    1\ntop_k                          64",
+            "template": mc.template or "{{- range $i, $_ := .Messages }}\n{{- $last := eq (len (slice $.Messages $i)) 1 }}\n{{- if or (eq .Role \"user\") (eq .Role \"system\") }}<start_of_turn>user\n{{ .Content }}<end_of_turn>\n{{ if $last }}<start_of_turn>model\n{{ end }}\n{{- else if eq .Role \"assistant\" }}<start_of_turn>model\n{{ .Content }}{{ if not $last }}<end_of_turn>\n{{ end }}\n{{- end }}\n{{- end }}",
             "details": {
-                "display_name": mc.display_name or alias,
-                "description": mc.description or "",
-                "api_version": mc.api_version,
-                "base_url": mc.base_url,
-                "parameter_size": mc.parameter_size or "",
-                "quantization_level": mc.quantization_level or "",
-                "format": mc.format or "",
-                "family": mc.family or "",
-                "families": mc.families or [],
-                "license": mc.license or "",
-                "adapter": mc.adapter or "",
-                "projector": mc.projector or "",
+                "parent_model": mc.parent_model or "",
+                "format": mc.format or "gguf",
+                "family": mc.family or "gemma3",  # Match real Ollama default
+                "families": mc.families or [mc.family or "gemma3"],
+                "parameter_size": mc.parameter_size or "999.89M",  # Match real Ollama default
+                "quantization_level": mc.quantization_level or "Q4_K_M",
             },
+            "model_info": {
+                "general.architecture": "gemma3",
+                "general.file_type": 15,
+                "general.parameter_count": 999885952,
+                "general.quantization_version": 2,
+                "tokenizer.ggml.model": "llama",
+                f"{mc.family or 'gemma3'}.context_length": 32768,
+                f"{mc.family or 'gemma3'}.embedding_length": 1152,
+                f"{mc.family or 'gemma3'}.block_count": 26,
+                f"{mc.family or 'gemma3'}.attention.head_count": 4,
+                f"{mc.family or 'gemma3'}.attention.head_count_kv": 1,
+            },
+            "tensors": [],  # Empty for simplicity, VS Code probably doesn't need this
+            "capabilities": ["completion"],  # This is crucial for VS Code!
+            "modified_at": mc.modified or now,
         }
         return info
-    # Fallback: treat alias as a direct model id using global settings
+    
+    # Fallback: treat alias as a direct model using real Ollama defaults
+    # Make sure not to double-add :latest if it's already there
+    final_name = alias if ':' in alias else f"{alias}:latest"
     return {
-        "name": alias,
-        "model": alias,
-        "modified_at": now,
-        "size": 0,
-        "digest": "",
-        "parameters": "",
-        "modelfile": "",
+        "license": "MIT License",
+        "modelfile": f"# Modelfile for {final_name}\nFROM {final_name}",
+        "parameters": "top_p                          0.95\nstop                           \"<end_of_turn>\"\ntemperature                    1\ntop_k                          64",
+        "template": "{{- range $i, $_ := .Messages }}\n{{- $last := eq (len (slice $.Messages $i)) 1 }}\n{{- if or (eq .Role \"user\") (eq .Role \"system\") }}<start_of_turn>user\n{{ .Content }}<end_of_turn>\n{{ if $last }}<start_of_turn>model\n{{ end }}\n{{- else if eq .Role \"assistant\" }}<start_of_turn>model\n{{ .Content }}{{ if not $last }}<end_of_turn>\n{{ end }}\n{{- end }}\n{{- end }}",
         "details": {
-            "display_name": alias,
-            "description": "",
-            "api_version": settings.gemini_api_version,
-            "base_url": settings.gemini_base_url,
-            "parameter_size": "",
-            "quantization_level": "",
-            "format": "",
-            "family": "",
-            "families": [],
-            "license": "",
-            "adapter": "",
-            "projector": "",
+            "parent_model": "",
+            "format": "gguf",
+            "family": "gemma3",
+            "families": ["gemma3"],
+            "parameter_size": "999.89M",
+            "quantization_level": "Q4_K_M",
         },
+        "model_info": {
+            "general.architecture": "gemma3",
+            "general.file_type": 15,
+            "general.parameter_count": 999885952,
+            "general.quantization_version": 2,
+            "tokenizer.ggml.model": "llama",
+            "gemma3.context_length": 32768,
+            "gemma3.embedding_length": 1152,
+            "gemma3.block_count": 26,
+            "gemma3.attention.head_count": 4,
+            "gemma3.attention.head_count_kv": 1,
+        },
+        "tensors": [],
+        "capabilities": ["completion"],  # This is crucial for VS Code!
+        "modified_at": now,
     }
 
 
 @router.get("/api/show")
 async def api_show_get(model: str | None = Query(default=None)):
-    """Compatibility: show model info.
+    """Compatibility: show model info. Requires model parameter."""
+    from .logger import get_logger
+    log = get_logger("api_show")
+    
+    log.info(f"GET /api/show called with model parameter: '{model}'")
+    
+    if not model:
+        # Match real Ollama behavior: return plain text 405
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("405 method not allowed", status_code=405)
+    
+    result = _build_show_info(model)
+    log.info(f"Returning show info for model '{model}': {str(result)[:200]}...")
+    return result
 
-    - If `model` is provided, return info for that alias/id.
-    - If not, return a list of all models in the registry.
-    """
-    if model:
-        return _build_show_info(model)
-    # list all
-    if settings.models:
-        return {"models": [_build_show_info(alias) for alias in settings.models.keys()]}
-    return {"models": [_build_show_info("gemini-1.5-pro")]}
+
+@router.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint for VS Code Copilot."""
+    from .logger import get_logger
+    log = get_logger("openai_chat")
+    
+    try:
+        payload = await request.json()
+    except Exception as e:
+        log.error(f"Failed to parse JSON payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    
+    log.info(f"POST /v1/chat/completions called with payload keys: {list(payload.keys())}")
+    
+    # Extract OpenAI format parameters
+    model = payload.get("model", "gemini25pro")
+    messages = payload.get("messages", [])
+    stream = payload.get("stream", False)
+    temperature = payload.get("temperature", 0.7)
+    max_tokens = payload.get("max_tokens")
+    top_p = payload.get("top_p")
+    
+    # Convert OpenAI messages to our format
+    ollama_messages = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        ollama_messages.append(Message(role=role, content=content))
+    
+    log.info(f"Converted {len(messages)} OpenAI messages to Ollama format for model '{model}'")
+    
+    # Convert to Gemini format
+    contents = ollama_messages_to_gemini_contents(ollama_messages)
+    
+    # Build generation config from OpenAI parameters
+    generation_config = {}
+    if temperature is not None:
+        generation_config["temperature"] = temperature
+    if max_tokens is not None:
+        generation_config["maxOutputTokens"] = max_tokens
+    if top_p is not None:
+        generation_config["topP"] = top_p
+    
+    gemini_payload = GeminiGenerateContentRequest(
+        contents=contents, 
+        generationConfig=generation_config or None,
+        tools=None  # VS Code Copilot usually doesn't use tools in chat
+    )
+    
+    if stream:
+        # Return streaming response in OpenAI format
+        async def openai_stream():
+            import json as _json
+            import uuid
+            
+            try:
+                stream_iter = await call_gemini(
+                    model=model, payload=gemini_payload, request=request, stream=True
+                )
+            except Exception as e:
+                log.error(f"Error calling Gemini: {e}")
+                error_response = {
+                    "error": {
+                        "message": str(e),
+                        "type": "gemini_error",
+                        "code": "service_unavailable"
+                    }
+                }
+                yield f"data: {_json.dumps(error_response)}\n\n"
+                return
+            
+            # Accumulate lines to form complete JSON (handle formatted response)
+            accumulated_lines = []
+            async for line in stream_iter:
+                accumulated_lines.append(line)
+            
+            # Parse the complete response
+            text, fn = _parse_gemini_stream_response(accumulated_lines)
+            
+            if text:
+                # Generate OpenAI-compatible streaming response
+                completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                
+                # Send the text content
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk", 
+                    "created": int(dt.datetime.now().timestamp()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": text},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {_json.dumps(chunk)}\n\n"
+                
+                # Send final chunk
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(dt.datetime.now().timestamp()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                yield f"data: {_json.dumps(final_chunk)}\n\n"
+            
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(openai_stream(), media_type="text/event-stream")
+    
+    else:
+        # Non-streaming response
+        import uuid
+        
+        try:
+            data = await call_gemini(model=model, payload=gemini_payload, request=request)
+            gem = GeminiResponse(**data)
+            
+            text = ""
+            if gem.candidates:
+                parts = gem.candidates[0].content.parts
+                if parts and parts[0].text:
+                    text = parts[0].text
+            
+            log.info(f"Returning OpenAI chat completion with {len(text)} characters")
+            
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(dt.datetime.now().timestamp()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": text
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 0,  # Gemini doesn't provide token counts
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }
+            
+        except Exception as e:
+            log.error(f"Error in non-streaming chat completion: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/api/show")
 async def api_show_post(payload: dict):
+    from .logger import get_logger
+    log = get_logger("api_show")
+    
+    log.info(f"POST /api/show called with payload: {payload}")
+    
     model = payload.get("model") or payload.get("name")
     if not model:
+        log.warning("POST /api/show called without model/name in payload")
         raise HTTPException(status_code=400, detail="model is required")
-    return _build_show_info(model)
+    
+    result = _build_show_info(model)
+    log.info(f"Returning show info for model '{model}': {str(result)[:200]}...")
+    return result
