@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 from dotenv import load_dotenv
 
@@ -23,14 +23,34 @@ def _slug_env(alias: str) -> str:
 
 @dataclass
 class ModelConfig:
+    # Required (no defaults) must come first
     alias: str
     model_id: str
     base_url: str
     api_version: str
-    api_key: Optional[str]
+    # Optional fields with defaults below
+    api_key: Optional[str] = None
+    name: Optional[str] = None
     display_name: Optional[str] = None
     description: Optional[str] = None
     modified: Optional[str] = None
+    # Optional metadata for Ollama-compatible listing
+    size: Optional[int] = None
+    digest: Optional[str] = None
+    parameter_size: Optional[str] = None
+    quantization_level: Optional[str] = None
+    format: Optional[str] = None
+    family: Optional[str] = None
+    families: Optional[List[str]] = None
+    parent_model: Optional[str] = None
+    # Additional show fields
+    parameters: Optional[str] = None
+    template: Optional[str] = None
+    system: Optional[str] = None
+    modelfile: Optional[str] = None
+    license: Optional[str] = None
+    adapter: Optional[str] = None
+    projector: Optional[str] = None
 
 
 class Settings:
@@ -59,6 +79,8 @@ class Settings:
         self.host: str = os.getenv("HOST", "0.0.0.0")
         # Ollama compatibility version for /api/version
         self.ollama_version: str = os.getenv("OLLAMA_VERSION", "0.1.32")
+        # Outbound streaming format for Ollama compatibility: ndjson or sse
+        self.stream_format: str = os.getenv("OLLAMA_STREAM_FORMAT", "ndjson").strip().lower()
 
         # Model registry
         self.models: Dict[str, ModelConfig] = self._load_models_from_env()
@@ -71,6 +93,8 @@ class Settings:
             for alias in aliases:
                 key = _slug_env(alias)
                 model_id = os.getenv(f"MODEL_{key}_ID", alias)
+                name = os.getenv(f"MODEL_{key}_NAME")
+                tag = os.getenv(f"MODEL_{key}_TAG")
                 base_url = os.getenv(
                     f"MODEL_{key}_BASE_URL", self.gemini_base_url
                 ).rstrip("/")
@@ -81,8 +105,31 @@ class Settings:
                 display_name = os.getenv(f"MODEL_{key}_DISPLAY_NAME")
                 description = os.getenv(f"MODEL_{key}_DESCRIPTION")
                 modified = os.getenv(f"MODEL_{key}_MODIFIED")
+                # Optional metadata
+                size_str = os.getenv(f"MODEL_{key}_SIZE")
+                size = int(size_str) if size_str and size_str.isdigit() else None
+                digest = os.getenv(f"MODEL_{key}_DIGEST")
+                parameter_size = os.getenv(f"MODEL_{key}_PARAMETER_SIZE")
+                quantization_level = os.getenv(f"MODEL_{key}_QUANTIZATION_LEVEL")
+                fmt = os.getenv(f"MODEL_{key}_FORMAT")
+                family = os.getenv(f"MODEL_{key}_FAMILY")
+                families_raw = os.getenv(f"MODEL_{key}_FAMILIES")
+                families = (
+                    [s.strip() for s in families_raw.split(",") if s.strip()]
+                    if families_raw
+                    else None
+                )
+                parent_model = os.getenv(f"MODEL_{key}_PARENT_MODEL")
+                parameters = os.getenv(f"MODEL_{key}_PARAMETERS")
+                template = os.getenv(f"MODEL_{key}_TEMPLATE")
+                system = os.getenv(f"MODEL_{key}_SYSTEM")
+                modelfile = os.getenv(f"MODEL_{key}_MODELFILE")
+                license_ = os.getenv(f"MODEL_{key}_LICENSE")
+                adapter = os.getenv(f"MODEL_{key}_ADAPTER")
+                projector = os.getenv(f"MODEL_{key}_PROJECTOR")
 
                 registry[alias] = ModelConfig(
+                    name=name or (f"{alias}:{tag}" if tag else f"{alias}:latest"),
                     alias=alias,
                     model_id=model_id,
                     base_url=base_url,
@@ -91,6 +138,21 @@ class Settings:
                     display_name=display_name,
                     description=description,
                     modified=modified,
+                    size=size,
+                    digest=digest,
+                    parameter_size=parameter_size,
+                    quantization_level=quantization_level,
+                    format=fmt,
+                    family=family,
+                    families=families,
+                    parent_model=parent_model,
+                    parameters=parameters,
+                    template=template,
+                    system=system,
+                    modelfile=modelfile,
+                    license=license_,
+                    adapter=adapter,
+                    projector=projector,
                 )
         return registry
 
@@ -124,9 +186,29 @@ def resolve_gemini_config(
     api_version = settings.gemini_api_version
     api_key = settings.gemini_api_key
 
-    if model_alias and model_alias in settings.models:
-        mc = settings.models[model_alias]
-        model_id = mc.model_id or model_alias
+    # Try to resolve alias allowing forms like "alias:tag" or "alias@digest"
+    mc = None
+    alias_key = None
+    if model_alias:
+        # exact match first
+        if model_alias in settings.models:
+            alias_key = model_alias
+            mc = settings.models[alias_key]
+        else:
+            base_candidate = model_alias.split(":", 1)[0].split("@", 1)[0]
+            if base_candidate in settings.models:
+                alias_key = base_candidate
+                mc = settings.models[alias_key]
+            else:
+                # match by configured display name `name`
+                for k, cand in settings.models.items():
+                    if cand.name == model_alias:
+                        alias_key = k
+                        mc = cand
+                        break
+
+    if mc is not None:
+        model_id = mc.model_id or (alias_key or model_alias)
         base_url = mc.base_url or base_url
         api_version = mc.api_version or api_version
         api_key = mc.api_key or api_key

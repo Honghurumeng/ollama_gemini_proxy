@@ -46,10 +46,30 @@ async def log_requests(request: Request, call_next):
         if k.lower() in {"authorization", "x-gemini-api-key"}:
             headers[k] = mask_secret(headers.get(k))
 
+    # Query params (mask potential secret-like keys) and build a safe query string
+    secret_q_keys = {"key", "api_key", "x-gemini-api-key", "authorization"}
+    query_params = dict(request.query_params)
+    for k in list(query_params.keys()):
+        if k.lower() in secret_q_keys:
+            query_params[k] = mask_secret(query_params.get(k))
+    try:
+        from urllib.parse import urlencode
+
+        safe_items = []
+        for k, v in request.query_params.multi_items():
+            safe_items.append((k, mask_secret(v) if k.lower() in secret_q_keys else v))
+        query_string_safe = urlencode(safe_items)
+    except Exception:
+        query_string_safe = ""
+
+    path_with_query = request.url.path + ("?" + query_string_safe if query_string_safe else "")
+
     log.info(
-        f"REQ {request.method} {request.url.path}",
+        f"REQ {request.method} {path_with_query}",
         extra={
             "extra_data": {
+                "url": str(request.url),
+                "query": query_params,
                 "headers": headers,
                 "body": truncate_text(body.decode(errors="ignore")),
             }
@@ -60,9 +80,11 @@ async def log_requests(request: Request, call_next):
 
     # 不读取 StreamingResponse 的 body，避免消费掉迭代器影响实际响应。
     log.info(
-        f"RES {request.method} {request.url.path} {response.status_code}",
+        f"RES {request.method} {path_with_query} {response.status_code}",
         extra={
             "extra_data": {
+                "url": str(request.url),
+                "query": query_params,
                 "headers": dict(response.headers),
                 "content_type": response.headers.get("content-type"),
             }

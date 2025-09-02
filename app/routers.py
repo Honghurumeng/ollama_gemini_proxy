@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, PlainTextResponse
 
 from .config import resolve_gemini_config, settings
@@ -130,6 +130,64 @@ async def call_gemini(model: str, payload: GeminiGenerateContentRequest, request
         await client.aclose()
 
 
+def _parse_gemini_stream_response(lines: list[str]) -> tuple[str, Optional[dict]]:
+    """Parse accumulated lines to extract text delta or functionCall from a Gemini response.
+
+    Returns (text, function_call_dict_or_None).
+    """
+    import json as _json
+    from .logger import get_logger
+    
+    log = get_logger("gemini_parser")
+
+    # Join all lines to form complete JSON
+    full_response = ''.join(lines)
+    log.info(f"Parsing complete Gemini response: {full_response[:300]}{'...' if len(full_response) > 300 else ''}")
+
+    try:
+        obj = _json.loads(full_response)
+        log.info(f"Successfully parsed JSON object, type: {type(obj)}")
+    except Exception as e:
+        log.warning(f"Failed to parse JSON: {e}")
+        return "", None
+
+    text = ""
+    fn = None
+    try:
+        # Handle both array and object responses
+        if isinstance(obj, list):
+            # If it's an array, take the first item
+            if obj:
+                response_obj = obj[0]
+                log.info("Processing array response, using first item")
+            else:
+                log.warning("Empty array response")
+                return "", None
+        else:
+            # If it's an object, use it directly
+            response_obj = obj
+            log.info("Processing object response")
+
+        cands = response_obj.get("candidates") or []
+        log.info(f"Found {len(cands)} candidates")
+        if cands:
+            parts = ((cands[0].get("content") or {}).get("parts") or [])
+            log.info(f"Found {len(parts)} parts in first candidate")
+            if parts:
+                p0 = parts[0]
+                if isinstance(p0, dict):
+                    text = p0.get("text") or ""
+                    fn = p0.get("functionCall")
+                    log.info(f"Extracted text: '{text[:100]}{'...' if len(text) > 100 else ''}', functionCall: {fn is not None}")
+    except Exception as e:
+        log.error(f"Error extracting content from Gemini response: {e}")
+        pass
+    
+    result_text = text or ""
+    log.info(f"Returning: text='{result_text[:50]}{'...' if len(result_text) > 50 else ''}', fn={fn is not None}")
+    return result_text, fn
+
+
 def _parse_gemini_stream_line(line: str) -> tuple[str, Optional[dict]]:
     """Extract text delta or functionCall from a Gemini stream line.
 
@@ -170,17 +228,70 @@ async def api_chat(req: ChatRequest, request: Request):
         contents=contents, generationConfig=generation_config, tools=normalize_tools(req.tools)
     )
 
-    if req.stream:
-        async def sse_gen():
-            stream_iter = call_gemini(
-                model=req.model, payload=payload, request=request, stream=True
-            )
-            async for line in stream_iter:
-                text, fn = _parse_gemini_stream_line(line)
-                if not text and not fn:
-                    continue
+    if req.stream and settings.stream_format == "ndjson":
+        async def ndjson_gen():
+            try:
+                stream_iter = await call_gemini(
+                    model=req.model, payload=payload, request=request, stream=True
+                )
+            except Exception as e:
                 import json as _json
+                err = {"model": req.model, "created_at": _now_iso(), "error": str(e), "done": True, "success": False}
+                yield (_json.dumps(err) + "\n").encode()
+                return
+            
+            # Accumulate lines to form complete JSON
+            accumulated_lines = []
+            async for line in stream_iter:
+                accumulated_lines.append(line)
+                
+            # Parse the complete response
+            text, fn = _parse_gemini_stream_response(accumulated_lines)
+            if text or fn:
+                import json as _json
+                event = {
+                    "model": req.model,
+                    "created_at": _now_iso(),
+                    "message": {"role": "assistant", "content": text or ""},
+                    "done": False,
+                }
+                if fn:
+                    event["tool_calls"] = [{"type": "function", **fn}]
+                yield (_json.dumps(event) + "\n").encode()
 
+            # done event
+            import json as _json
+            done_obj = {
+                "model": req.model, 
+                "created_at": _now_iso(), 
+                "message": {"role": "assistant", "content": ""}, 
+                "done": True, 
+                "success": True
+            }
+            yield (_json.dumps(done_obj) + "\n").encode()
+
+        return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+    elif req.stream:
+        async def sse_gen():
+            try:
+                stream_iter = await call_gemini(
+                    model=req.model, payload=payload, request=request, stream=True
+                )
+            except Exception as e:
+                import json as _json
+                err = {"model": req.model, "created_at": _now_iso(), "error": str(e), "done": True, "success": False}
+                yield ("data: " + _json.dumps(err) + "\n\n").encode()
+                return
+            
+            # Accumulate lines to form complete JSON
+            accumulated_lines = []
+            async for line in stream_iter:
+                accumulated_lines.append(line)
+                
+            # Parse the complete response
+            text, fn = _parse_gemini_stream_response(accumulated_lines)
+            if text or fn:
+                import json as _json
                 event = {
                     "model": req.model,
                     "created_at": _now_iso(),
@@ -194,10 +305,11 @@ async def api_chat(req: ChatRequest, request: Request):
             # done event
             import json as _json
             done_obj = {
-                "model": req.model,
-                "created_at": _now_iso(),
-                "message": {"role": "assistant", "content": ""},
-                "done": True,
+                "model": req.model, 
+                "created_at": _now_iso(), 
+                "message": {"role": "assistant", "content": ""}, 
+                "done": True, 
+                "success": True
             }
             yield ("data: " + _json.dumps(done_obj) + "\n\n").encode()
 
@@ -236,17 +348,70 @@ async def api_generate(req: GenerateRequest, request: Request):
         contents=contents, generationConfig=generation_config, tools=normalize_tools(req.tools)
     )
 
-    if req.stream:
-        async def sse_gen():
-            stream_iter = call_gemini(
-                model=req.model, payload=payload, request=request, stream=True
-            )
-            async for line in stream_iter:
-                text, fn = _parse_gemini_stream_line(line)
-                if not text and not fn:
-                    continue
+    if req.stream and settings.stream_format == "ndjson":
+        async def ndjson_gen():
+            try:
+                stream_iter = await call_gemini(
+                    model=req.model, payload=payload, request=request, stream=True
+                )
+            except Exception as e:
                 import json as _json
+                err = {"model": req.model, "created_at": _now_iso(), "error": str(e), "done": True, "success": False}
+                yield (_json.dumps(err) + "\n").encode()
+                return
+            
+            # Accumulate lines to form complete JSON
+            accumulated_lines = []
+            async for line in stream_iter:
+                accumulated_lines.append(line)
+                
+            # Parse the complete response
+            text, fn = _parse_gemini_stream_response(accumulated_lines)
+            if text or fn:
+                import json as _json
+                event = {
+                    "model": req.model,
+                    "created_at": _now_iso(),
+                    "response": text or "",
+                    "done": False,
+                }
+                if fn:
+                    event["tool_calls"] = [{"type": "function", **fn}]
+                yield (_json.dumps(event) + "\n").encode()
 
+            # done event
+            import json as _json
+            done_obj = {
+                "model": req.model, 
+                "created_at": _now_iso(), 
+                "response": "", 
+                "done": True, 
+                "success": True
+            }
+            yield (_json.dumps(done_obj) + "\n").encode()
+
+        return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+    elif req.stream:
+        async def sse_gen():
+            try:
+                stream_iter = await call_gemini(
+                    model=req.model, payload=payload, request=request, stream=True
+                )
+            except Exception as e:
+                import json as _json
+                err = {"model": req.model, "created_at": _now_iso(), "error": str(e), "done": True, "success": False}
+                yield ("data: " + _json.dumps(err) + "\n\n").encode()
+                return
+            
+            # Accumulate lines to form complete JSON
+            accumulated_lines = []
+            async for line in stream_iter:
+                accumulated_lines.append(line)
+                
+            # Parse the complete response
+            text, fn = _parse_gemini_stream_response(accumulated_lines)
+            if text or fn:
+                import json as _json
                 event = {
                     "model": req.model,
                     "created_at": _now_iso(),
@@ -260,10 +425,11 @@ async def api_generate(req: GenerateRequest, request: Request):
             # done event
             import json as _json
             done_obj = {
-                "model": req.model,
-                "created_at": _now_iso(),
-                "response": "",
-                "done": True,
+                "model": req.model, 
+                "created_at": _now_iso(), 
+                "response": "", 
+                "done": True, 
+                "success": True
             }
             yield ("data: " + _json.dumps(done_obj) + "\n\n").encode()
 
@@ -294,34 +460,50 @@ async def api_generate(req: GenerateRequest, request: Request):
 
 @router.get("/api/tags")
 async def api_tags():
-    # Emulate Ollama /api/tags listing
-    # When registry is empty, return the passthrough default model/version
+    # Emulate Ollama /api/tags listing as closely as possible.
     items = []
     now = _now_iso()
     if settings.models:
         for alias, mc in settings.models.items():
             items.append(
                 {
-                    "name": alias,
+                    "name": mc.name or f"{alias}:latest",
                     "model": mc.model_id,
                     "modified_at": mc.modified or now,
+                    "size": mc.size or 0,
+                    "digest": mc.digest or "",
                     "details": {
+                        "parent_model": mc.parent_model or "",
+                        "format": mc.format or "gguf",
+                        "family": mc.family or "",
+                        "families": mc.families or [],
+                        "parameter_size": mc.parameter_size or "",
+                        "quantization_level": mc.quantization_level or "",
                         "display_name": mc.display_name or alias,
                         "description": mc.description or "",
-                        "api_version": mc.api_version,
-                        "base_url": mc.base_url,
+                        # Non-Ollama native fields kept for transparency
+                        "api_version": mc.api_version or "",
+                        "base_url": mc.base_url or "",
                     },
                 }
             )
     else:
         items.append(
             {
-                "name": "gemini-default",
+                "name": "gemini-default:latest",
                 "model": "gemini-1.5-pro",
                 "modified_at": now,
+                "size": 0,
+                "digest": "",
                 "details": {
-                    "api_version": settings.gemini_api_version,
-                    "base_url": settings.gemini_base_url,
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": "",
+                    "families": [],
+                    "parameter_size": "",
+                    "quantization_level": "",
+                    "api_version": "",
+                    "base_url": "",
                 },
             }
         )
@@ -332,3 +514,80 @@ async def api_tags():
 async def api_version():
     # Minimal Ollama compatibility endpoint
     return {"version": settings.ollama_version}
+
+
+def _build_show_info(alias: str) -> dict:
+    now = _now_iso()
+    if alias in settings.models:
+        mc = settings.models[alias]
+        info = {
+            "name": alias,
+            "model": mc.model_id,
+            "modified_at": mc.modified or now,
+            "size": mc.size or 0,
+            "digest": mc.digest or "",
+            "parameters": mc.parameters or "",
+            "modelfile": mc.modelfile or "",
+            "details": {
+                "display_name": mc.display_name or alias,
+                "description": mc.description or "",
+                "api_version": mc.api_version,
+                "base_url": mc.base_url,
+                "parameter_size": mc.parameter_size or "",
+                "quantization_level": mc.quantization_level or "",
+                "format": mc.format or "",
+                "family": mc.family or "",
+                "families": mc.families or [],
+                "license": mc.license or "",
+                "adapter": mc.adapter or "",
+                "projector": mc.projector or "",
+            },
+        }
+        return info
+    # Fallback: treat alias as a direct model id using global settings
+    return {
+        "name": alias,
+        "model": alias,
+        "modified_at": now,
+        "size": 0,
+        "digest": "",
+        "parameters": "",
+        "modelfile": "",
+        "details": {
+            "display_name": alias,
+            "description": "",
+            "api_version": settings.gemini_api_version,
+            "base_url": settings.gemini_base_url,
+            "parameter_size": "",
+            "quantization_level": "",
+            "format": "",
+            "family": "",
+            "families": [],
+            "license": "",
+            "adapter": "",
+            "projector": "",
+        },
+    }
+
+
+@router.get("/api/show")
+async def api_show_get(model: str | None = Query(default=None)):
+    """Compatibility: show model info.
+
+    - If `model` is provided, return info for that alias/id.
+    - If not, return a list of all models in the registry.
+    """
+    if model:
+        return _build_show_info(model)
+    # list all
+    if settings.models:
+        return {"models": [_build_show_info(alias) for alias in settings.models.keys()]}
+    return {"models": [_build_show_info("gemini-1.5-pro")]}
+
+
+@router.post("/api/show")
+async def api_show_post(payload: dict):
+    model = payload.get("model") or payload.get("name")
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    return _build_show_info(model)

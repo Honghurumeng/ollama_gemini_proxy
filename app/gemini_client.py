@@ -15,8 +15,10 @@ class GeminiClient:
 
     def _endpoint_for_model(self, model: str, *, stream: bool = False) -> str:
         # Gemini path: /{version}/models/{model}:generateContent or streamGenerateContent
+        # Some gateways expect raw model id without alias-style tags like ":latest".
+        safe_model = model.split(":", 1)[0].split("@", 1)[0]
         action = "streamGenerateContent" if stream else "generateContent"
-        return f"{self.base_url}/{self.version}/models/{model}:{action}"
+        return f"{self.base_url}/{self.version}/models/{safe_model}:{action}"
 
     async def generate_content(self, model: str, payload: dict) -> httpx.Response:
         params = {}
