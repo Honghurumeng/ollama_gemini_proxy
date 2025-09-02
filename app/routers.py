@@ -154,37 +154,65 @@ def _parse_gemini_stream_response(lines: list[str]) -> tuple[str, Optional[dict]
     text = ""
     fn = None
     try:
-        # Handle both array and object responses
+        # Handle JSON array of streaming blocks (Gemini's actual format)
         if isinstance(obj, list):
-            # If it's an array, take the first item
-            if obj:
-                response_obj = obj[0]
-                log.info("Processing array response, using first item")
-            else:
-                log.warning("Empty array response")
-                return "", None
+            log.info(f"Processing {len(obj)} streaming blocks")
+            
+            # Collect text from ALL streaming blocks, not just the first one  
+            all_text_parts = []
+            
+            for i, block in enumerate(obj):
+                if not isinstance(block, dict):
+                    continue
+                    
+                cands = block.get("candidates") or []
+                log.debug(f"Block {i}: {len(cands)} candidates")
+                
+                for candidate in cands:
+                    parts = ((candidate.get("content") or {}).get("parts") or [])
+                    
+                    for part in parts:
+                        if isinstance(part, dict):
+                            part_text = part.get("text")
+                            if part_text:
+                                all_text_parts.append(part_text)
+                                log.debug(f"Block {i}: extracted '{part_text[:100]}{'...' if len(part_text) > 100 else ''}'")
+                            
+                            # Check for function call in any part
+                            part_fn = part.get("functionCall")
+                            if part_fn:
+                                fn = part_fn
+                                log.info(f"Block {i}: found functionCall")
+            
+            # Combine all text parts from all blocks
+            text = ''.join(all_text_parts)
+            log.info(f"Combined {len(all_text_parts)} text parts from {len(obj)} blocks: total {len(text)} chars")
         else:
-            # If it's an object, use it directly
-            response_obj = obj
-            log.info("Processing object response")
-
-        cands = response_obj.get("candidates") or []
-        log.info(f"Found {len(cands)} candidates")
-        if cands:
-            parts = ((cands[0].get("content") or {}).get("parts") or [])
-            log.info(f"Found {len(parts)} parts in first candidate")
-            if parts:
-                p0 = parts[0]
-                if isinstance(p0, dict):
-                    text = p0.get("text") or ""
-                    fn = p0.get("functionCall")
-                    log.info(f"Extracted text: '{text[:100]}{'...' if len(text) > 100 else ''}', functionCall: {fn is not None}")
+            # Handle single object (fallback for non-streaming responses)
+            log.info("Processing single object response")
+            cands = obj.get("candidates") or []
+            
+            text_parts = []
+            for candidate in cands:
+                parts = ((candidate.get("content") or {}).get("parts") or [])
+                
+                for part in parts:
+                    if isinstance(part, dict):
+                        part_text = part.get("text")
+                        if part_text:
+                            text_parts.append(part_text)
+                        
+                        part_fn = part.get("functionCall")
+                        if part_fn:
+                            fn = part_fn
+            
+            text = ''.join(text_parts)
     except Exception as e:
         log.error(f"Error extracting content from Gemini response: {e}")
         pass
     
     result_text = text or ""
-    log.info(f"Returning: text='{result_text[:50]}{'...' if len(result_text) > 50 else ''}', fn={fn is not None}")
+    log.info(f"Final result: {len(result_text)} chars - '{result_text[:200]}{'...' if len(result_text) > 200 else ''}'")
     return result_text, fn
 
 
@@ -194,30 +222,61 @@ def _parse_gemini_stream_line(line: str) -> tuple[str, Optional[dict]]:
     Returns (text, function_call_dict_or_None).
     """
     import json as _json
+    from .logger import get_logger
+    
+    log = get_logger("stream_line_parser")
 
     # Some servers may prepend 'data: ' for SSE framing; strip it if present.
     if line.startswith("data: "):
         line = line[len("data: "):]
 
+    if not line.strip():
+        return "", None
+        
+    log.debug(f"Parsing line: {line[:200]}{'...' if len(line) > 200 else ''}")
+
     try:
         obj = _json.loads(line)
-    except Exception:
+        log.debug(f"Successfully parsed JSON: {type(obj)}")
+    except Exception as e:
+        log.debug(f"Failed to parse JSON: {e}")
         return "", None
 
     text = ""
     fn = None
     try:
         cands = obj.get("candidates") or []
+        log.debug(f"Found {len(cands)} candidates")
         if cands:
             parts = ((cands[0].get("content") or {}).get("parts") or [])
-            if parts:
-                p0 = parts[0]
-                if isinstance(p0, dict):
-                    text = p0.get("text") or ""
-                    fn = p0.get("functionCall")
-    except Exception:
+            log.debug(f"Found {len(parts)} parts")
+            
+            # Process ALL parts, not just the first one
+            text_parts = []
+            for i, part in enumerate(parts):
+                if isinstance(part, dict):
+                    part_text = part.get("text")
+                    if part_text:
+                        text_parts.append(part_text)
+                        log.debug(f"Part {i}: found text '{part_text[:50]}{'...' if len(part_text) > 50 else ''}'")
+                    
+                    # Check for function call in any part
+                    part_fn = part.get("functionCall")
+                    if part_fn:
+                        fn = part_fn
+                        log.debug(f"Part {i}: found functionCall")
+            
+            # Combine all text parts
+            text = ''.join(text_parts)
+            if text_parts:
+                log.debug(f"Combined {len(text_parts)} parts: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+    except Exception as e:
+        log.error(f"Error processing candidates: {e}")
         pass
-    return text or "", fn
+    
+    result = (text or "", fn)
+    log.debug(f"Returning: text_len={len(result[0])}, has_fn={result[1] is not None}")
+    return result
 
 
 @router.post("/api/chat")
@@ -240,16 +299,22 @@ async def api_chat(req: ChatRequest, request: Request):
                 yield (_json.dumps(err) + "\n").encode()
                 return
             
-            # For Cline compatibility: process line by line for better streaming
+            # Process stream with enhanced buffering and fallback
             accumulated_lines = []
-            has_content = False
+            has_streaming_content = False
+            
+            from .logger import get_logger
+            log = get_logger("stream_processor")
             
             async for line in stream_iter:
                 accumulated_lines.append(line)
-                # Try to parse each line individually for better streaming
+                log.debug(f"Received stream line: {len(line)} chars - {line[:100]}{'...' if len(line) > 100 else ''}")
+                
+                # Try real-time parsing first
                 text, fn = _parse_gemini_stream_line(line)
                 if text or fn:
-                    has_content = True
+                    has_streaming_content = True
+                    log.info(f"Real-time parsed content: text_len={len(text)}, has_fn={fn is not None}")
                     import json as _json
                     event = {
                         "model": req.model,
@@ -261,10 +326,18 @@ async def api_chat(req: ChatRequest, request: Request):
                         event["message"]["tool_calls"] = [{"type": "function", **fn}]
                     yield (_json.dumps(event) + "\n").encode()
             
-            # Fallback: if no line-by-line content, try accumulated parsing
-            if not has_content:
+            log.info(f"Stream processing complete: {len(accumulated_lines)} lines, has_streaming_content={has_streaming_content}")
+            
+            # Enhanced fallback: always try accumulated parsing for complete responses
+            if accumulated_lines:
+                log.info("Attempting enhanced parsing of all accumulated content")
                 text, fn = _parse_gemini_stream_response(accumulated_lines)
-                if text or fn:
+                
+                # Only yield if we haven't already yielded content, or if this gives us more/better content
+                should_yield = not has_streaming_content or (text and len(text) > 50)  # Threshold for "significant" content
+                
+                if should_yield and (text or fn):
+                    log.info(f"Enhanced parsing successful: text_len={len(text)}, has_fn={fn is not None}")
                     import json as _json
                     event = {
                         "model": req.model,
@@ -275,6 +348,8 @@ async def api_chat(req: ChatRequest, request: Request):
                     if fn:
                         event["message"]["tool_calls"] = [{"type": "function", **fn}]
                     yield (_json.dumps(event) + "\n").encode()
+                elif not has_streaming_content:
+                    log.warning("No content extracted from stream - this may cause Cline errors!")
 
             # done event
             import json as _json
@@ -300,24 +375,20 @@ async def api_chat(req: ChatRequest, request: Request):
                 yield ("data: " + _json.dumps(err) + "\n\n").encode()
                 return
             
-            # Accumulate lines to form complete JSON
-            accumulated_lines = []
+            # Process stream in real-time for better streaming experience
             async for line in stream_iter:
-                accumulated_lines.append(line)
-                
-            # Parse the complete response
-            text, fn = _parse_gemini_stream_response(accumulated_lines)
-            if text or fn:
-                import json as _json
-                event = {
-                    "model": req.model,
-                    "created_at": _now_iso(),
-                    "message": {"role": "assistant", "content": text or ""},
-                    "done": False,
-                }
-                if fn:
-                    event["tool_calls"] = [{"type": "function", **fn}]
-                yield ("data: " + _json.dumps(event) + "\n\n").encode()
+                text, fn = _parse_gemini_stream_line(line)
+                if text or fn:
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": text or ""},
+                        "done": False,
+                    }
+                    if fn:
+                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                    yield ("data: " + _json.dumps(event) + "\n\n").encode()
 
             # done event
             import json as _json
@@ -339,12 +410,16 @@ async def api_chat(req: ChatRequest, request: Request):
     tool_calls = []
     if gem.candidates:
         parts = gem.candidates[0].content.parts
-        if parts:
-            first = parts[0]
-            if first.text:
-                text = first.text
-            if first.functionCall:
-                tool_calls.append({"type": "function", **first.functionCall})
+        # Process ALL parts, not just the first one
+        text_parts = []
+        for part in parts:
+            if part.text:
+                text_parts.append(part.text)
+            if part.functionCall:
+                tool_calls.append({"type": "function", **part.functionCall})
+        
+        # Combine all text parts
+        text = ''.join(text_parts)
 
     return {
         "model": req.model,
@@ -377,16 +452,17 @@ async def api_generate(req: GenerateRequest, request: Request):
                 yield (_json.dumps(err) + "\n").encode()
                 return
             
-            # For Cline compatibility: process line by line for better streaming
+            # Process stream with fallback mechanism for better compatibility
             accumulated_lines = []
-            has_content = False
+            has_streaming_content = False
             
             async for line in stream_iter:
                 accumulated_lines.append(line)
-                # Try to parse each line individually for better streaming
+                
+                # Try real-time parsing first
                 text, fn = _parse_gemini_stream_line(line)
                 if text or fn:
-                    has_content = True
+                    has_streaming_content = True
                     import json as _json
                     event = {
                         "model": req.model,
@@ -398,8 +474,8 @@ async def api_generate(req: GenerateRequest, request: Request):
                         event["tool_calls"] = [{"type": "function", **fn}]
                     yield (_json.dumps(event) + "\n").encode()
             
-            # Fallback: if no line-by-line content, try accumulated parsing
-            if not has_content:
+            # Fallback: if real-time parsing failed, try accumulated parsing
+            if not has_streaming_content and accumulated_lines:
                 text, fn = _parse_gemini_stream_response(accumulated_lines)
                 if text or fn:
                     import json as _json
@@ -437,24 +513,20 @@ async def api_generate(req: GenerateRequest, request: Request):
                 yield ("data: " + _json.dumps(err) + "\n\n").encode()
                 return
             
-            # Accumulate lines to form complete JSON
-            accumulated_lines = []
+            # Process stream in real-time for better streaming experience
             async for line in stream_iter:
-                accumulated_lines.append(line)
-                
-            # Parse the complete response
-            text, fn = _parse_gemini_stream_response(accumulated_lines)
-            if text or fn:
-                import json as _json
-                event = {
-                    "model": req.model,
-                    "created_at": _now_iso(),
-                    "response": text or "",
-                    "done": False,
-                }
-                if fn:
-                    event["tool_calls"] = [{"type": "function", **fn}]
-                yield ("data: " + _json.dumps(event) + "\n\n").encode()
+                text, fn = _parse_gemini_stream_line(line)
+                if text or fn:
+                    import json as _json
+                    event = {
+                        "model": req.model,
+                        "created_at": _now_iso(),
+                        "response": text or "",
+                        "done": False,
+                    }
+                    if fn:
+                        event["tool_calls"] = [{"type": "function", **fn}]
+                    yield ("data: " + _json.dumps(event) + "\n\n").encode()
 
             # done event
             import json as _json
@@ -476,12 +548,16 @@ async def api_generate(req: GenerateRequest, request: Request):
     tool_calls = []
     if gem.candidates:
         parts = gem.candidates[0].content.parts
-        if parts:
-            first = parts[0]
-            if first.text:
-                text = first.text
-            if first.functionCall:
-                tool_calls.append({"type": "function", **first.functionCall})
+        # Process ALL parts, not just the first one
+        text_parts = []
+        for part in parts:
+            if part.text:
+                text_parts.append(part.text)
+            if part.functionCall:
+                tool_calls.append({"type": "function", **part.functionCall})
+        
+        # Combine all text parts
+        text = ''.join(text_parts)
 
     return {
         "model": req.model,
