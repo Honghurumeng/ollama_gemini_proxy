@@ -28,6 +28,24 @@ def _now_iso() -> str:
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
 
 
+def _fn_to_tool_call(fn: dict) -> dict:
+    """Convert a Gemini functionCall dict to a standard tool_call object expected by
+    Ollama/OpenAI-style clients: {type,function:{name,arguments}}.
+    """
+    import json as _json
+
+    name = fn.get("name") or "tool"
+    args = fn.get("args") or {}
+    # OpenAI style uses stringified JSON for arguments
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": _json.dumps(args, ensure_ascii=False),
+        },
+    }
+
+
 def ollama_messages_to_gemini_contents(messages: List[Message]) -> List[GeminiContent]:
     contents: List[GeminiContent] = []
     import json as _json
@@ -84,8 +102,38 @@ def options_to_generation_config(options: Optional[Dict[str, Any]]) -> Optional[
 
 
 def normalize_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]:
+    """Normalize incoming tools to Gemini format.
+
+    Supports:
+    - Gemini style: {"functionDeclarations": [...]} or {"function_declarations": [...]} as-is.
+    - OpenAI style: [{"type":"function","function": {"name","description?","parameters"}}]
+      which will be converted into a single Gemini tool with functionDeclarations list.
+    """
     if not tools:
         return None
+
+    # Detect OpenAI style (flat list of {type:function,function:{...}})
+    is_openai_style = all(
+        isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict)
+        for t in tools
+    )
+    if is_openai_style:
+        fns: List[dict] = []
+        for t in tools:
+            f = t.get("function") or {}
+            decl = {
+                "name": f.get("name"),
+                # Gemini accepts description/parameters similar to OpenAI JSON Schema
+                "description": f.get("description"),
+                "parameters": f.get("parameters"),
+            }
+            # Drop Nones
+            decl = {k: v for k, v in decl.items() if v is not None}
+            if decl.get("name"):
+                fns.append(decl)
+        return [{"functionDeclarations": fns}] if fns else None
+
+    # Pass-through Gemini style, with underscore-to-camel alias fix
     out: List[dict] = []
     for t in tools:
         if not isinstance(t, dict):
@@ -323,7 +371,9 @@ async def api_chat(req: ChatRequest, request: Request):
                         "done": False,
                     }
                     if fn:
-                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                        event["message"]["tool_calls"] = [_fn_to_tool_call(fn)]
+                        # For tool call steps, some clients expect empty content
+                        event["message"]["content"] = ""
                     yield (_json.dumps(event) + "\n").encode()
             
             log.info(f"Stream processing complete: {len(accumulated_lines)} lines, has_streaming_content={has_streaming_content}")
@@ -346,7 +396,8 @@ async def api_chat(req: ChatRequest, request: Request):
                         "done": False,
                     }
                     if fn:
-                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                        event["message"]["tool_calls"] = [_fn_to_tool_call(fn)]
+                        event["message"]["content"] = ""
                     yield (_json.dumps(event) + "\n").encode()
                 elif not has_streaming_content:
                     log.warning("No content extracted from stream - this may cause Cline errors!")
@@ -387,7 +438,8 @@ async def api_chat(req: ChatRequest, request: Request):
                         "done": False,
                     }
                     if fn:
-                        event["message"]["tool_calls"] = [{"type": "function", **fn}]
+                        event["message"]["tool_calls"] = [_fn_to_tool_call(fn)]
+                        event["message"]["content"] = ""
                     yield ("data: " + _json.dumps(event) + "\n\n").encode()
 
             # done event
@@ -416,7 +468,7 @@ async def api_chat(req: ChatRequest, request: Request):
             if part.text:
                 text_parts.append(part.text)
             if part.functionCall:
-                tool_calls.append({"type": "function", **part.functionCall})
+                tool_calls.append(_fn_to_tool_call(part.functionCall))
         
         # Combine all text parts
         text = ''.join(text_parts)
@@ -471,7 +523,8 @@ async def api_generate(req: GenerateRequest, request: Request):
                         "done": False,
                     }
                     if fn:
-                        event["tool_calls"] = [{"type": "function", **fn}]
+                        event["tool_calls"] = [_fn_to_tool_call(fn)]
+                        event["response"] = ""
                     yield (_json.dumps(event) + "\n").encode()
             
             # Fallback: if real-time parsing failed, try accumulated parsing
@@ -486,7 +539,8 @@ async def api_generate(req: GenerateRequest, request: Request):
                         "done": False,
                     }
                     if fn:
-                        event["tool_calls"] = [{"type": "function", **fn}]
+                        event["tool_calls"] = [_fn_to_tool_call(fn)]
+                        event["response"] = ""
                     yield (_json.dumps(event) + "\n").encode()
 
             # done event
@@ -709,7 +763,7 @@ def _build_show_info(alias: str) -> dict:
                 f"{mc.family or 'gemma3'}.attention.head_count_kv": 1,
             },
             "tensors": [],  # Empty for simplicity, VS Code probably doesn't need this
-            "capabilities": ["completion"],  # This is crucial for VS Code!
+            "capabilities": ["completion","tools"],  # This is crucial for VS Code!
             "modified_at": mc.modified or now,
         }
         return info
@@ -743,7 +797,7 @@ def _build_show_info(alias: str) -> dict:
             "gemma3.attention.head_count_kv": 1,
         },
         "tensors": [],
-        "capabilities": ["completion"],  # This is crucial for VS Code!
+        "capabilities": ["completion","tools"],  # This is crucial for VS Code!
         "modified_at": now,
     }
 
@@ -783,17 +837,41 @@ async def openai_chat_completions(request: Request):
     # Extract OpenAI format parameters
     model = payload.get("model", "gemini25pro")
     messages = payload.get("messages", [])
+    tools = payload.get("tools")
     stream = payload.get("stream", False)
     temperature = payload.get("temperature", 0.7)
     max_tokens = payload.get("max_tokens")
     top_p = payload.get("top_p")
-    
-    # Convert OpenAI messages to our format
-    ollama_messages = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        ollama_messages.append(Message(role=role, content=content))
+
+    # Convert OpenAI messages (including tool results) to internal format
+    def _openai_messages_to_ollama_messages(msgs: List[dict]) -> List[Message]:
+        id_to_name: Dict[str, str] = {}
+        for m in msgs:
+            if m.get("role") == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    try:
+                        if tc.get("type") == "function":
+                            fid = tc.get("id")
+                            fname = ((tc.get("function") or {}).get("name"))
+                            if fid and fname:
+                                id_to_name[fid] = fname
+                    except Exception:
+                        pass
+
+        out: List[Message] = []
+        for m in msgs:
+            role = m.get("role", "user")
+            if role == "tool":
+                # Map tool result to our 'tool' role with a name
+                name = m.get("name") or id_to_name.get(m.get("tool_call_id", "")) or "tool"
+                content = m.get("content", "")
+                out.append(Message(role="tool", content=content or "", name=name))
+            else:
+                content = m.get("content", "")
+                out.append(Message(role=role, content=content or ""))
+        return out
+
+    ollama_messages = _openai_messages_to_ollama_messages(messages)
     
     log.info(f"Converted {len(messages)} OpenAI messages to Ollama format for model '{model}'")
     
@@ -810,9 +888,9 @@ async def openai_chat_completions(request: Request):
         generation_config["topP"] = top_p
     
     gemini_payload = GeminiGenerateContentRequest(
-        contents=contents, 
+        contents=contents,
         generationConfig=generation_config or None,
-        tools=None  # VS Code Copilot usually doesn't use tools in chat
+        tools=normalize_tools(tools) if tools else None,
     )
     
     if stream:
@@ -844,36 +922,64 @@ async def openai_chat_completions(request: Request):
             
             # Parse the complete response
             text, fn = _parse_gemini_stream_response(accumulated_lines)
-            
-            if text:
-                # Generate OpenAI-compatible streaming response
-                completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-                
-                # Send the text content
+
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            if fn:
+                # Emit a tool_call in OpenAI streaming format
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_call = _fn_to_tool_call(fn)
+                # Attach an id and index for streaming delta
+                delta = {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": call_id,
+                            **tool_call,
+                        }
+                    ]
+                }
                 chunk = {
                     "id": completion_id,
-                    "object": "chat.completion.chunk", 
+                    "object": "chat.completion.chunk",
                     "created": int(dt.datetime.now().timestamp()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": None
-                    }]
+                    "choices": [
+                        {"index": 0, "delta": delta, "finish_reason": None}
+                    ],
                 }
                 yield f"data: {_json.dumps(chunk)}\n\n"
-                
-                # Send final chunk
+
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": int(dt.datetime.now().timestamp()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                    ],
+                }
+                yield f"data: {_json.dumps(final_chunk)}\n\n"
+            elif text:
+                # Emit standard text chunks
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(dt.datetime.now().timestamp()),
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                    ],
+                }
+                yield f"data: {_json.dumps(chunk)}\n\n"
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(dt.datetime.now().timestamp()),
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    ],
                 }
                 yield f"data: {_json.dumps(final_chunk)}\n\n"
             
@@ -888,33 +994,55 @@ async def openai_chat_completions(request: Request):
         try:
             data = await call_gemini(model=model, payload=gemini_payload, request=request)
             gem = GeminiResponse(**data)
-            
+
             text = ""
+            tool_calls = []
             if gem.candidates:
                 parts = gem.candidates[0].content.parts
-                if parts and parts[0].text:
-                    text = parts[0].text
-            
-            log.info(f"Returning OpenAI chat completion with {len(text)} characters")
-            
+                for part in parts:
+                    if part.text:
+                        text += part.text
+                    if part.functionCall:
+                        tool_calls.append(_fn_to_tool_call(part.functionCall))
+
+            log.info(
+                f"Returning OpenAI chat completion with text_len={len(text)}, tool_calls={len(tool_calls)}"
+            )
+
+            finish = "tool_calls" if tool_calls else "stop"
+            message = {
+                "role": "assistant",
+                "content": None if tool_calls else text,
+            }
+            if tool_calls:
+                # Attach ids for OpenAI compatibility
+                import uuid as _uuid
+                enriched = []
+                for idx, tc in enumerate(tool_calls):
+                    enriched.append({
+                        "id": f"call_{_uuid.uuid4().hex[:24]}",
+                        "index": idx,
+                        **tc,
+                    })
+                message["tool_calls"] = enriched
+
             return {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "id": f"chatcmpl-{__import__('uuid').uuid4().hex}",
                 "object": "chat.completion",
                 "created": int(dt.datetime.now().timestamp()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": text
-                    },
-                    "finish_reason": "stop"
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish,
+                    }
+                ],
                 "usage": {
-                    "prompt_tokens": 0,  # Gemini doesn't provide token counts
+                    "prompt_tokens": 0,
                     "completion_tokens": 0,
-                    "total_tokens": 0
-                }
+                    "total_tokens": 0,
+                },
             }
             
         except Exception as e:
